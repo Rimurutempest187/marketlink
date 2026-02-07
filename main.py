@@ -895,15 +895,13 @@ async def text_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # default echo
     await update.message.reply_text("Command not recognized. Use /help")
 
-
 # ----- Fall back / cancel -----
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-
-# ---------- MAIN ----------
+#-----Main-------
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set. Please export BOT_TOKEN environment variable.")
@@ -923,7 +921,10 @@ def main():
             ORDER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_phone)],
             ORDER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_address)],
             ORDER_SHOPPING: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_shopping)],
-            ORDER_PHOTO: [MessageHandler(filters.PHOTO, order_photo_receive), MessageHandler(filters.TEXT & ~filters.COMMAND, order_photo_receive)],
+            ORDER_PHOTO: [
+                MessageHandler(filters.PHOTO, order_photo_receive),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, order_photo_receive),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_user=True,
@@ -956,7 +957,12 @@ def main():
     # Subscription payment conversation
     pay_conv = ConversationHandler(
         entry_points=[CommandHandler("pay_subscribe", pay_subscription_start)],
-        states={PAYMENT_WAIT: [MessageHandler(filters.PHOTO, pay_subscription_receive), MessageHandler(filters.TEXT & ~filters.COMMAND, pay_subscription_receive)]},
+        states={
+            PAYMENT_WAIT: [
+                MessageHandler(filters.PHOTO, pay_subscription_receive),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pay_subscription_receive),
+            ]
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_user=True,
     )
@@ -986,3 +992,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
