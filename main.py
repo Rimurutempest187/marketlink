@@ -903,7 +903,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-Enoch_005 ÄJ, [2/7/2026 5:40 PM]
 # ---------- MAIN ----------
 def main():
     # 1. Environment Variable များကို စစ်ဆေးခြင်း
@@ -993,8 +992,7 @@ def main():
     app.add_handler(pay_conv)
     app.add_handler(CommandHandler("pending_payments", cmd_pending_payments))
 
-Enoch_005 ÄJ, [2/7/2026 5:40 PM]
-app.add_handler(CommandHandler("export_orders", cmd_export_orders))
+    app.add_handler(CommandHandler("export_orders", cmd_export_orders))
     app.add_handler(CommandHandler("my_link", cmd_my_link))
     app.add_handler(CallbackQueryHandler(admin_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_menu_handler))
