@@ -1,23 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MarketLink Pro - Full Bot (single file, aiosqlite version)
-Features:
-- Shop register / trial / subscription (admin approve)
-- Products (add / list / edit / delete)
-- Links (add / edit)
-- Orders with cart + checkout + payment screenshot
-- Payment queue (admin approve) -> extend subscription or confirm order
-- Export orders to Excel (owner)
-- Designed to run on Pydroid / Termux (aiosqlite -> non-blocking)
+MarketLink Pro - Full Bot (single file)
+Upgraded to use aiosqlite (async sqlite) to reduce blocking.
+Includes previous fixes: ADMIN_ID syntax, price-check, product name parsing,
+admin callback authorization, cancel cleanup, list_links, etc.
 """
 import os
 import logging
 import traceback
 import asyncio
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-load_dotenv()
+
 import aiosqlite
 from telegram import (
     Update,
@@ -35,9 +29,10 @@ from telegram.ext import (
     ConversationHandler,
     CallbackQueryHandler,
 )
-
+from dotenv import load_dotenv
+load_dotenv()
 # ---------- CONFIG ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # or hardcode "123:ABC..."
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 try:
     ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 except Exception:
@@ -55,93 +50,89 @@ TRIAL_DAYS = 3
 (PAYMENT_WAIT,) = range(11, 12)
 
 # ---------- LOG ----------
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
+)
 log = logging.getLogger(__name__)
 
-
-# ---------- ASYNC DB UTILITIES ----------
+# ---------- Async DB UTILITIES ----------
 async def init_db():
     os.makedirs(PHOTOS_DIR, exist_ok=True)
-    async with aiosqlite.connect(DB_FILE) as con:
-        await con.execute(
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.executescript(
             """
-        CREATE TABLE IF NOT EXISTS shops (
-            owner_id INTEGER PRIMARY KEY,
-            shop_name TEXT,
-            expire_date TEXT,
-            created_at TEXT
-        )"""
+    CREATE TABLE IF NOT EXISTS shops (
+        owner_id INTEGER PRIMARY KEY,
+        shop_name TEXT,
+        expire_date TEXT,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER,
+        name TEXT,
+        price INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER,
+        title TEXT,
+        url TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        shop_id INTEGER,
+        user_id INTEGER,
+        name TEXT,
+        phone TEXT,
+        address TEXT,
+        items TEXT,
+        total INTEGER,
+        photo_path TEXT,
+        status TEXT,
+        created_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS payments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uid INTEGER,
+        kind TEXT,
+        ref_id INTEGER,
+        photo_path TEXT,
+        status TEXT,
+        created_at TEXT
+    );
+    """
         )
-        await con.execute(
-            """
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id INTEGER,
-            name TEXT,
-            price INTEGER
-        )"""
-        )
-        await con.execute(
-            """
-        CREATE TABLE IF NOT EXISTS links (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id INTEGER,
-            title TEXT,
-            url TEXT
-        )"""
-        )
-        await con.execute(
-            """
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            shop_id INTEGER,
-            user_id INTEGER,
-            name TEXT,
-            phone TEXT,
-            address TEXT,
-            items TEXT,
-            total INTEGER,
-            photo_path TEXT,
-            status TEXT,
-            created_at TEXT
-        )"""
-        )
-        await con.execute(
-            """
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            uid INTEGER,
-            kind TEXT,
-            ref_id INTEGER,
-            photo_path TEXT,
-            status TEXT,
-            created_at TEXT
-        )"""
-        )
-        await con.commit()
+        await db.commit()
 
 
-# shop
 async def db_get_shop(owner_id):
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute("SELECT owner_id, shop_name, expire_date, created_at FROM shops WHERE owner_id=?", (owner_id,))
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT owner_id, shop_name, expire_date, created_at FROM shops WHERE owner_id=?", (owner_id,))
         row = await cur.fetchone()
+        await cur.close()
         return row
 
 
 async def db_set_shop(owner_id, shop_name, expire_date):
-    async with aiosqlite.connect(DB_FILE) as con:
-        await con.execute(
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
             "INSERT OR REPLACE INTO shops(owner_id, shop_name, expire_date, created_at) VALUES(?,?,?,?)",
             (owner_id, shop_name, expire_date, datetime.now().strftime("%Y-%m-%d")),
         )
-        await con.commit()
+        await db.commit()
 
 
 async def db_extend_shop(owner_id, days):
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute("SELECT expire_date FROM shops WHERE owner_id=?", (owner_id,))
+    async with aiosqlite.connect(DB_FILE) as db:
+        cur = await db.execute("SELECT expire_date FROM shops WHERE owner_id=?", (owner_id,))
         row = await cur.fetchone()
+        await cur.close()
         if row and row[0]:
             try:
                 cur_exp = datetime.strptime(row[0], "%Y-%m-%d")
@@ -150,137 +141,148 @@ async def db_extend_shop(owner_id, days):
         else:
             cur_exp = datetime.now()
         new_exp = (cur_exp + timedelta(days=days)).strftime("%Y-%m-%d")
-        await con.execute("UPDATE shops SET expire_date=? WHERE owner_id=?", (new_exp, owner_id))
-        await con.commit()
+        await db.execute("UPDATE shops SET expire_date=? WHERE owner_id=?", (new_exp, owner_id))
+        await db.commit()
         return new_exp
 
 
-# products
 async def db_add_product(owner_id, name, price):
-    async with aiosqlite.connect(DB_FILE) as con:
-        await con.execute("INSERT INTO products(owner_id, name, price) VALUES(?,?,?)", (owner_id, name, price))
-        await con.commit()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("INSERT INTO products(owner_id, name, price) VALUES(?,?,?)", (owner_id, name, price))
+        await db.commit()
 
 
 async def db_list_products(owner_id):
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute("SELECT id, name, price FROM products WHERE owner_id=?", (owner_id,))
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, name, price FROM products WHERE owner_id=?", (owner_id,))
         rows = await cur.fetchall()
+        await cur.close()
         return rows
 
 
 async def db_get_product(pid, owner_id=None):
-    async with aiosqlite.connect(DB_FILE) as con:
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
         if owner_id:
-            cur = await con.execute("SELECT id, name, price FROM products WHERE id=? AND owner_id=?", (pid, owner_id))
+            cur = await db.execute("SELECT id, name, price FROM products WHERE id=? AND owner_id=?", (pid, owner_id))
         else:
-            cur = await con.execute("SELECT id, name, price FROM products WHERE id=?", (pid,))
+            cur = await db.execute("SELECT id, name, price FROM products WHERE id=?", (pid,))
         row = await cur.fetchone()
+        await cur.close()
         return row
 
 
 async def db_update_product(pid, owner_id, name, price):
-    async with aiosqlite.connect(DB_FILE) as con:
-        await con.execute("UPDATE products SET name=?, price=? WHERE id=? AND owner_id=?", (name, price, pid, owner_id))
-        await con.commit()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("UPDATE products SET name=?, price=? WHERE id=? AND owner_id=?", (name, price, pid, owner_id))
+        await db.commit()
 
 
 async def db_delete_product(pid, owner_id):
-    async with aiosqlite.connect(DB_FILE) as con:
-        await con.execute("DELETE FROM products WHERE id=? AND owner_id=?", (pid, owner_id))
-        await con.commit()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("DELETE FROM products WHERE id=? AND owner_id=?", (pid, owner_id))
+        await db.commit()
 
 
-# links
 async def db_add_link(owner_id, title, url):
-    async with aiosqlite.connect(DB_FILE) as con:
-        await con.execute("INSERT INTO links(owner_id, title, url) VALUES(?,?,?)", (owner_id, title, url))
-        await con.commit()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("INSERT INTO links(owner_id, title, url) VALUES(?,?,?)", (owner_id, title, url))
+        await db.commit()
 
 
 async def db_list_links(owner_id):
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute("SELECT id, title, url FROM links WHERE owner_id=?", (owner_id,))
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, title, url FROM links WHERE owner_id=?", (owner_id,))
         rows = await cur.fetchall()
+        await cur.close()
         return rows
 
 
 async def db_get_link(lid, owner_id):
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute("SELECT id, title, url FROM links WHERE id=? AND owner_id=?", (lid, owner_id))
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, title, url FROM links WHERE id=? AND owner_id=?", (lid, owner_id))
         row = await cur.fetchone()
+        await cur.close()
         return row
 
 
 async def db_update_link(lid, owner_id, title, url):
-    async with aiosqlite.connect(DB_FILE) as con:
-        await con.execute("UPDATE links SET title=?, url=? WHERE id=? AND owner_id=?", (title, url, lid, owner_id))
-        await con.commit()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("UPDATE links SET title=?, url=? WHERE id=? AND owner_id=?", (title, url, lid, owner_id))
+        await db.commit()
 
 
-# orders & payments
 async def db_create_order(shop_id, user_id, name, phone, address, items, total, photo_path):
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute(
+    async with aiosqlite.connect(DB_FILE) as db:
+        cur = await db.execute(
             "INSERT INTO orders(shop_id, user_id, name, phone, address, items, total, photo_path, status, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
             (shop_id, user_id, name, phone, address, items, total, photo_path, "Pending", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
-        await con.commit()
-        return cur.lastrowid
+        await db.commit()
+        oid = cur.lastrowid
+        await cur.close()
+        return oid
 
 
 async def db_get_order(oid):
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute("SELECT id, shop_id, user_id, name, phone, address, items, total, photo_path, status, created_at FROM orders WHERE id=?", (oid,))
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, shop_id, user_id, name, phone, address, items, total, photo_path, status, created_at FROM orders WHERE id=?", (oid,))
         row = await cur.fetchone()
+        await cur.close()
         return row
 
 
 async def db_update_order_status(oid, status):
-    async with aiosqlite.connect(DB_FILE) as con:
-        await con.execute("UPDATE orders SET status=? WHERE id=?", (status, oid))
-        await con.commit()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("UPDATE orders SET status=? WHERE id=?", (status, oid))
+        await db.commit()
 
 
 async def db_insert_payment(uid, kind, ref_id, photo_path):
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute("INSERT INTO payments(uid, kind, ref_id, photo_path, status, created_at) VALUES(?,?,?,?,?,?)", (uid, kind, ref_id, photo_path, "pending", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        await con.commit()
-        return cur.lastrowid
+    async with aiosqlite.connect(DB_FILE) as db:
+        cur = await db.execute("INSERT INTO payments(uid, kind, ref_id, photo_path, status, created_at) VALUES(?,?,?,?,?,?)", (uid, kind, ref_id, photo_path, "pending", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        await db.commit()
+        pid = cur.lastrowid
+        await cur.close()
+        return pid
 
 
 async def db_get_pending_payments():
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute("SELECT id, uid, kind, ref_id, photo_path, status, created_at FROM payments WHERE status='pending' ORDER BY id ASC")
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, uid, kind, ref_id, photo_path, status, created_at FROM payments WHERE status='pending' ORDER BY id ASC")
         rows = await cur.fetchall()
+        await cur.close()
         return rows
 
 
 async def db_update_payment_status(pid, status):
-    async with aiosqlite.connect(DB_FILE) as con:
-        await con.execute("UPDATE payments SET status=? WHERE id=?", (status, pid))
-        await con.commit()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("UPDATE payments SET status=? WHERE id=?", (status, pid))
+        await db.commit()
 
 
 async def db_list_orders_by_shop(owner_id):
-    async with aiosqlite.connect(DB_FILE) as con:
-        cur = await con.execute("SELECT id, user_id, name, phone, address, items, total, status, created_at FROM orders WHERE shop_id=? ORDER BY id DESC", (owner_id,))
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT id, user_id, name, phone, address, items, total, status, created_at FROM orders WHERE shop_id=? ORDER BY id DESC", (owner_id,))
         rows = await cur.fetchall()
+        await cur.close()
         return rows
 
 
 # ---------- HELPERS ----------
-def fmt_date(d):
-    return d if d else "-"
-
-
 async def is_shop_active(owner_id):
     if owner_id == ADMIN_ID:
         return True
     shop = await db_get_shop(owner_id)
     if not shop:
         return False
-    exp = shop[2]
+    exp = shop["expire_date"] if "expire_date" in shop.keys() else shop[2]
     if not exp:
         return False
     try:
@@ -293,12 +295,17 @@ async def extend_by_days(owner_id, days):
     return await db_extend_shop(owner_id, days)
 
 
+def fmt_date(d):
+    return d if d else "-"
+
+
 # ---------- BOT HANDLERS ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = update.effective_user.id
         args = context.args or []
 
+        # deep link to shop: /start <shop_id>
         if args:
             try:
                 shop_id = int(args[0])
@@ -311,33 +318,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["current_shop_id"] = shop_id
             shop = await db_get_shop(shop_id)
             if shop:
-                await update.message.reply_text(f"🏪 **{shop[1]}** မှ ကြိုဆိုပါသည်။\n/Order ဖြင့်မှာယူပါ။", reply_markup=ReplyKeyboardRemove())
+                await update.message.reply_text(f"🏪 **{shop['shop_name']}** မှ ကြိုဆိုပါသည်။\n/Order ဖြင့်မှာယူပါ။", reply_markup=ReplyKeyboardRemove())
             else:
                 await update.message.reply_text("Shop not found.")
             return
 
-        # admin panel
+        # Admin
         if uid == ADMIN_ID:
             kb = [["📊 Platform Stats", "📥 Pending Payments"], ["🏬 All Shops", "📤 Broadcast"]]
             await update.message.reply_text("👑 Admin Panel", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
             return
 
+        # Owner
         shop = await db_get_shop(uid)
         if shop:
             if not await is_shop_active(uid):
                 await update.message.reply_text("❌ Your shop subscription has expired. Please renew using /pay_subscribe.")
                 return
             kb = [["➕ Add Product", "🛒 My Orders"], ["🔗 My Link", "💳 Subscription"]]
-            await update.message.reply_text(f"🏪 Owner Panel: {shop[1]}", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
+            await update.message.reply_text(f"🏪 Owner Panel: {shop['shop_name']}", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
             return
 
+        # New user
         kb = [["📝 Create Shop (/setup_shop MyShopName)", "ℹ️ Help"]]
         await update.message.reply_text("Welcome to MarketLink Pro!\nTo create a shop: /setup_shop <ShopName>", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     except Exception:
         log.exception("start error")
 
 
-# shop setup
+# ----- Shop setup -----
 async def setup_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = update.effective_user.id
@@ -352,7 +361,7 @@ async def setup_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("setup_shop")
 
 
-# product commands
+# ----- Product commands -----
 async def cmd_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = update.effective_user.id
@@ -384,13 +393,13 @@ async def cmd_list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         text = "📦 Your Products:\n\n"
         for r in rows:
-            text += f"ID:{r[0]} • {r[1]} • {r[2]} MMK\n"
+            text += f"ID:{r['id']} • {r['name']} • {r['price']} MMK\n"
         await update.message.reply_text(text)
     except Exception:
         log.exception("list_products")
 
 
-# edit product conv
+# Edit product (conversation)
 async def edit_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     rows = await db_list_products(uid)
@@ -399,7 +408,7 @@ async def edit_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     msg = "Send Product ID to edit:\n\n"
     for r in rows:
-        msg += f"ID:{r[0]} • {r[1]} • {r[2]} MMK\n"
+        msg += f"ID:{r['id']} • {r['name']} • {r['price']} MMK\n"
     await update.message.reply_text(msg)
     return EDIT_PROD_ID
 
@@ -416,7 +425,7 @@ async def edit_product_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("Product not found or not yours.")
         return EDIT_PROD_ID
     context.user_data["edit_product_id"] = pid
-    await update.message.reply_text(f"Old name: {prod[1]}\nSend new name:")
+    await update.message.reply_text(f"Old name: {prod['name']}\nSend new name:")
     return EDIT_PROD_NAME
 
 
@@ -440,6 +449,7 @@ async def edit_product_price(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
+# delete product
 async def cmd_delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = update.effective_user.id
@@ -453,7 +463,7 @@ async def cmd_delete_product(update: Update, context: ContextTypes.DEFAULT_TYPE)
         log.exception("del_product")
 
 
-# links
+# ----- Links -----
 async def cmd_add_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = update.effective_user.id
@@ -477,13 +487,13 @@ async def cmd_list_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         txt = "🔗 Your Links:\n\n"
         for r in rows:
-            txt += f"ID:{r[0]} • {r[1]} • {r[2]}\n"
+            txt += f"ID:{r['id']} • {r['title']} • {r['url']}\n"
         await update.message.reply_text(txt)
     except Exception:
         log.exception("list_links")
 
 
-# edit link conv
+# Edit link conversation
 async def edit_link_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     rows = await db_list_links(uid)
@@ -492,7 +502,7 @@ async def edit_link_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     msg = "✏️ Your Links (ID)\n\n"
     for r in rows:
-        msg += f"ID:{r[0]} • {r[1]} • {r[2]}\n"
+        msg += f"ID:{r['id']} • {r['title']} • {r['url']}\n"
     msg += "\nSend Link ID to edit:"
     await update.message.reply_text(msg)
     return EDIT_LINK_ID
@@ -510,7 +520,7 @@ async def edit_link_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Not found / not your link.")
         return EDIT_LINK_ID
     context.user_data["edit_link_id"] = lid
-    await update.message.reply_text(f"Old title: {link[1]}\nSend new title:")
+    await update.message.reply_text(f"Old title: {link['title']}\nSend new title:")
     return EDIT_LINK_TITLE
 
 
@@ -530,7 +540,7 @@ async def edit_link_get_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# order flow
+# ----- Order Flow -----
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "current_shop_id" not in context.user_data:
         await update.message.reply_text("Please open shop link first (/start <shop_id>)")
@@ -555,6 +565,7 @@ async def order_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def order_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["cust_address"] = update.message.text.strip()
+    # show products
     sid = context.user_data["current_shop_id"]
     prods = await db_list_products(sid)
     if not prods:
@@ -562,7 +573,7 @@ async def order_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     kb = []
     for p in prods:
-        kb.append([f"{p[1]}:{p[2]}"])
+        kb.append([f"{p['name']}:{p['price']}"])
     kb.append(["🛒 View Cart", "✅ Checkout"])
     await update.message.reply_text("Select product (name:price) to add to cart:", reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
     return ORDER_SHOPPING
@@ -578,16 +589,17 @@ async def order_shopping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "✅ Checkout":
         await update.message.reply_text("Send payment screenshot (WavePay / KBZPay) or type /cancel to abort", reply_markup=ReplyKeyboardRemove())
         return ORDER_PHOTO
+    # expect name:price but verify price from DB
     if ":" in text:
         try:
             name = text.split(":", 1)[0].strip()
             sid = context.user_data["current_shop_id"]
             prods = await db_list_products(sid)
-            prod = next((p for p in prods if p[1] == name), None)
+            prod = next((p for p in prods if p["name"] == name), None)
             if not prod:
                 await update.message.reply_text("Invalid product. Use the shown buttons or type the correct product name.")
                 return ORDER_SHOPPING
-            price = int(prod[2])
+            price = int(prod["price"])
             context.user_data.setdefault("cart", []).append(f"{name}:{price}")
             context.user_data["total"] = context.user_data.get("total", 0) + price
             await update.message.reply_text(f"Added {name} - {price} MMK. Total: {context.user_data['total']}")
@@ -610,7 +622,7 @@ async def order_photo_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
         oid = await db_create_order(sid, uid, context.user_data.get("cust_name"), context.user_data.get("cust_phone"), context.user_data.get("cust_address"), ",".join(context.user_data.get("cart", [])), context.user_data.get("total", 0), filename)
         pid = await db_insert_payment(uid, "order", oid, filename)
         shop = await db_get_shop(sid)
-        owner_id = shop[0] if shop else None
+        owner_id = shop["owner_id"] if shop and "owner_id" in shop.keys() else (shop[0] if shop else None)
         kb = [
             [InlineKeyboardButton("Confirm Order ✅", callback_data=f"order_conf_{oid}_{pid}"),
              InlineKeyboardButton("Reject ❌", callback_data=f"order_rej_{oid}_{pid}")]
@@ -634,7 +646,7 @@ async def order_photo_receive(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# subscription
+# ----- Subscription Payment (user pays to extend) -----
 async def pay_subscription_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Subscription fee: {FEE} MMK\nSend screenshot after payment.")
     return PAYMENT_WAIT
@@ -665,7 +677,7 @@ async def pay_subscription_receive(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
-# admin/owner callbacks
+# ----- Admin / Owner callbacks (approve subscription / orders) -----
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -705,10 +717,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not order:
                 await q.edit_message_text("Order not found.")
                 return
-            user_id = order[2]
-            shop_id = order[1]
+            user_id = order["user_id"] if "user_id" in order.keys() else order[2]
+            shop_id = order["shop_id"] if "shop_id" in order.keys() else order[1]
             shop = await db_get_shop(shop_id)
-            owner_id = shop[0] if shop else None
+            owner_id = shop["owner_id"] if shop and "owner_id" in shop.keys() else (shop[0] if shop else None)
             if caller != ADMIN_ID and caller != owner_id:
                 await q.answer("Not authorized", show_alert=True)
                 return
@@ -736,7 +748,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# pending payments list (admin)
+# ----- Admin command: list pending payments -----
 async def cmd_pending_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("Only admin.")
@@ -746,7 +758,13 @@ async def cmd_pending_payments(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("No pending payments.")
         return
     for p in rows:
-        pid, uid, kind, ref_id, path, status, created = p
+        pid = p["id"]
+        uid = p["uid"]
+        kind = p["kind"]
+        ref_id = p["ref_id"]
+        path = p["photo_path"]
+        status = p["status"]
+        created = p["created_at"]
         text = f"PID:{pid} UID:{uid} Kind:{kind} Ref:{ref_id} Status:{status} Created:{created}"
         try:
             if path and os.path.exists(path):
@@ -764,10 +782,10 @@ async def cmd_pending_payments(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(text + "\n(send failed)")
 
 
-# export orders
+# ----- Owner export orders to excel -----
 async def cmd_export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        import pandas as pd
+        import pandas as pd  # local import
     except Exception:
         await update.message.reply_text("Pandas not installed. Install pandas + openpyxl to export.")
         return
@@ -779,15 +797,15 @@ async def cmd_export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df = []
     for r in rows:
         df.append({
-            "order_id": r[0],
-            "user_id": r[1],
-            "name": r[2],
-            "phone": r[3],
-            "address": r[4],
-            "items": r[5],
-            "total": r[6],
-            "status": r[7],
-            "created_at": r[8],
+            "order_id": r["id"],
+            "user_id": r["user_id"],
+            "name": r["name"],
+            "phone": r["phone"],
+            "address": r["address"],
+            "items": r["items"],
+            "total": r["total"],
+            "status": r["status"],
+            "created_at": r["created_at"],
         })
     df = __import__("pandas").DataFrame(df)
     path = f"orders_{uid}_{int(datetime.now().timestamp())}.xlsx"
@@ -805,7 +823,7 @@ async def cmd_export_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# utility - my link
+# ----- Utility: show shop link -----
 async def cmd_my_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     try:
@@ -818,16 +836,18 @@ async def cmd_my_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"https://t.me/{bot_username}?start={uid}")
 
 
-# menu handler
+# ----- Menu message handler -----
 async def text_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     uid = update.effective_user.id
 
+    # block expired owner quickly
     shop = await db_get_shop(uid)
     if shop and not await is_shop_active(uid):
         await update.message.reply_text("❌ Your subscription expired. Please renew with /pay_subscribe.")
         return
 
+    # Owner options
     if t == "➕ Add Product" or t == "/add_product":
         await update.message.reply_text("Use /add_product <name> <price> or /list_products to manage.")
         return
@@ -838,7 +858,7 @@ async def text_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         msg = "📦 Your Orders:\n\n"
         for r in rows:
-            msg += f"#{r[0]} | {r[2]} | {r[6]} MMK | {r[7]}\n"
+            msg += f"#{r['id']} | {r['name']} | {r['total']} MMK | {r['status']}\n"
         await update.message.reply_text(msg)
         return
     if t == "🔗 My Link":
@@ -846,37 +866,37 @@ async def text_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "💳 Subscription":
         await update.message.reply_text(f"Subscription is {FEE} MMK per month.\nUse /pay_subscribe to pay.", reply_markup=ReplyKeyboardRemove()); return
 
+    # Admin menu
     if uid == ADMIN_ID:
         if t == "📊 Platform Stats":
             async with aiosqlite.connect(DB_FILE) as con:
-                cur = await con.execute("SELECT COUNT(*) FROM shops")
-                shops = (await cur.fetchone())[0]
-                cur = await con.execute("SELECT COUNT(*) FROM orders")
-                orders = (await cur.fetchone())[0]
-                cur = await con.execute("SELECT COUNT(*) FROM payments WHERE status='pending'")
-                pend = (await cur.fetchone())[0]
+                cur = await con.execute("SELECT COUNT(*) FROM shops"); shops = (await cur.fetchone())[0]; await cur.close()
+                cur = await con.execute("SELECT COUNT(*) FROM orders"); orders = (await cur.fetchone())[0]; await cur.close()
+                cur = await con.execute("SELECT COUNT(*) FROM payments WHERE status='pending'"); pend = (await cur.fetchone())[0]; await cur.close()
             await update.message.reply_text(f"Shops:{shops}\nOrders:{orders}\nPending payments:{pend}")
             return
         if t == "📥 Pending Payments":
             await cmd_pending_payments(update, context); return
         if t == "🏬 All Shops":
             async with aiosqlite.connect(DB_FILE) as con:
-                cur = await con.execute("SELECT owner_id, shop_name, expire_date FROM shops")
-                rows = await cur.fetchall()
+                con.row_factory = aiosqlite.Row
+                cur = await con.execute("SELECT owner_id, shop_name, expire_date FROM shops"); rows = await cur.fetchall(); await cur.close()
             txt = "All Shops:\n"
             for r in rows:
-                txt += f"ID:{r[0]} • {r[1]} • Exp:{r[2]}\n"
+                txt += f"ID:{r['owner_id']} • {r['shop_name']} • Exp:{r['expire_date']}\n"
             await update.message.reply_text(txt)
             return
 
+    # general fallback
     if t == "ℹ️ Help" or t == "/help":
         await update.message.reply_text("/setup_shop, /add_product, /list_products, /edit_product, /add_link, /edit_link, /order (open shop link first) /pay_subscribe")
         return
 
+    # default echo
     await update.message.reply_text("Command not recognized. Use /help")
 
 
-# cancel fallback
+# ----- Fall back / cancel -----
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
@@ -889,12 +909,13 @@ def main():
         raise RuntimeError("BOT_TOKEN is not set. Please export BOT_TOKEN environment variable.")
     if ADMIN_ID == 0:
         log.warning("ADMIN_ID is 0 or not set. Set ADMIN_ID environment variable to your Telegram id for admin actions.")
-    # initialize DB (async)
+
+    # initialize DB (async) before starting bot
     asyncio.run(init_db())
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # conversations
+    # Order conversation
     order_conv = ConversationHandler(
         entry_points=[CommandHandler("order", order_start)],
         states={
@@ -908,6 +929,7 @@ def main():
         per_user=True,
     )
 
+    # Edit link conversation
     edit_link_conv = ConversationHandler(
         entry_points=[CommandHandler("edit_link", edit_link_start)],
         states={
@@ -919,6 +941,7 @@ def main():
         per_user=True,
     )
 
+    # Edit product conversation
     edit_prod_conv = ConversationHandler(
         entry_points=[CommandHandler("edit_product", edit_product_start)],
         states={
@@ -930,6 +953,7 @@ def main():
         per_user=True,
     )
 
+    # Subscription payment conversation
     pay_conv = ConversationHandler(
         entry_points=[CommandHandler("pay_subscribe", pay_subscription_start)],
         states={PAYMENT_WAIT: [MessageHandler(filters.PHOTO, pay_subscription_receive), MessageHandler(filters.TEXT & ~filters.COMMAND, pay_subscription_receive)]},
@@ -937,7 +961,7 @@ def main():
         per_user=True,
     )
 
-    # register handlers
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup_shop", setup_shop))
     app.add_handler(CommandHandler("add_product", cmd_add_product))
