@@ -901,18 +901,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-#-----Main-------
-def main():
+
+# ---------- MAIN ----------
+async def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set. Please export BOT_TOKEN environment variable.")
     if ADMIN_ID == 0:
         log.warning("ADMIN_ID is 0 or not set. Set ADMIN_ID environment variable to your Telegram id for admin actions.")
 
-    # initialize DB (async) before starting bot
-    asyncio.run(init_db())
+    # FIX 1: Use 'await' instead of asyncio.run() because we are already inside an async function
+    log.info("Initializing Database...")
+    await init_db()
 
+    # FIX 2: Build the application
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # --- Conversation Handlers ---
+    
     # Order conversation
     order_conv = ConversationHandler(
         entry_points=[CommandHandler("order", order_start)],
@@ -986,10 +991,19 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_menu_handler))
     app.add_handler(CommandHandler("cancel", cancel))
 
+# FIX 3: Start the bot properly using a context manager
+    # This is the most stable way to run v20+ bots inside an async main
     log.info("Bot starting...")
-    app.run_polling()
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        # Keep the bot running until interrupted
+        await asyncio.Event().wait()
 
-
-if __name__ == "__main__":
-    main()
-
+if name == "main":
+    try:
+        # FIX 4: Correct the entry point name and run the async main
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Bot stopped.")
