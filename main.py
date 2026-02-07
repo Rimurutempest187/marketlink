@@ -1001,7 +1001,7 @@ async def main():
         # Keep the bot running until interrupted
         await asyncio.Event().wait()
 
-if __name__ ==__ "main"__:
+if __name__ == "__main__":
     try:
         # FIX 4: Correct the entry point name and run the async main
         asyncio.run(main())
