@@ -905,23 +905,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- MAIN ----------
 def main():
-    # 1. Environment Variable များကို စစ်ဆေးခြင်း
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set. Please export BOT_TOKEN environment variable.")
-    
     if ADMIN_ID == 0:
         log.warning("ADMIN_ID is 0 or not set. Set ADMIN_ID environment variable to your Telegram id for admin actions.")
 
-    # 2. Database ကို အလိုအလျောက် Initialize လုပ်ပေးမည့် function
-    async def post_init(application: Application):
-        log.info("Initializing database...")
-        await init_db()
+    # initialize DB (async) before starting bot
+    asyncio.run(init_db())
 
-    # 3. Application တည်ဆောက်ခြင်း
-    # post_init ကို သုံးခြင်းဖြင့် Runtime Loop Error ကို ဖြေရှင်းပေးပါသည်
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # --- ConversationHandlers ---
+    app = Application.builder().token(BOT_TOKEN).build()
 
     # Order conversation
     order_conv = ConversationHandler(
@@ -931,10 +923,7 @@ def main():
             ORDER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_phone)],
             ORDER_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_address)],
             ORDER_SHOPPING: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_shopping)],
-            ORDER_PHOTO: [
-                MessageHandler(filters.PHOTO, order_photo_receive), 
-                MessageHandler(filters.TEXT & ~filters.COMMAND, order_photo_receive)
-            ],
+            ORDER_PHOTO: [MessageHandler(filters.PHOTO, order_photo_receive), MessageHandler(filters.TEXT & ~filters.COMMAND, order_photo_receive)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_user=True,
@@ -967,18 +956,12 @@ def main():
     # Subscription payment conversation
     pay_conv = ConversationHandler(
         entry_points=[CommandHandler("pay_subscribe", pay_subscription_start)],
-        states={
-            PAYMENT_WAIT: [
-                MessageHandler(filters.PHOTO, pay_subscription_receive), 
-                MessageHandler(filters.TEXT & ~filters.COMMAND, pay_subscription_receive)
-            ]
-        },
+        states={PAYMENT_WAIT: [MessageHandler(filters.PHOTO, pay_subscription_receive), MessageHandler(filters.TEXT & ~filters.COMMAND, pay_subscription_receive)]},
         fallbacks=[CommandHandler("cancel", cancel)],
         per_user=True,
     )
 
-    # --- Register handlers ---
-    
+    # Register handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("setup_shop", setup_shop))
     app.add_handler(CommandHandler("add_product", cmd_add_product))
@@ -991,17 +974,15 @@ def main():
     app.add_handler(order_conv)
     app.add_handler(pay_conv)
     app.add_handler(CommandHandler("pending_payments", cmd_pending_payments))
-
     app.add_handler(CommandHandler("export_orders", cmd_export_orders))
     app.add_handler(CommandHandler("my_link", cmd_my_link))
     app.add_handler(CallbackQueryHandler(admin_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_menu_handler))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    # 4. Start the Bot
     log.info("Bot starting...")
     app.run_polling()
 
 
-if name == "main":
+if __name__ == "__main__":
     main()
